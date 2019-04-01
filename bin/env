@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+
+if [[ -z "${INSTANCE_NAME}" ]]; then
+  export INSTANCE_NAME=pipesock
+fi
+
+if [ -z "$IP" ]; then
+  export IP=127.0.0.1
+fi
+
+if [ -z "$NODE_NAME" ]; then
+  export NODE_NAME=${INSTANCE_NAME}@${IP}
+fi
+
+if [ -z "$COOKIE" ]; then
+  export COOKIE=pipesock
+fi
+
+RELNAME="`dirname \"$0\"`"/${INSTANCE_NAME}
+exec ${RELNAME} "$@"
