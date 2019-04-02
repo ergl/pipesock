@@ -3,7 +3,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/2,
+-export([start_link/3,
          send_cb/3,
          send_sync/3,
          close/1]).
@@ -53,9 +53,18 @@
 %%%===================================================================
 
 -spec start_link(IP :: inet:ip_address(),
-                 Port :: inet:port_number()) -> {ok, pid()} | {error, term()}.
-start_link(IP, Port) ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [IP, Port], []).
+                 Port :: inet:port_number(),
+                 N :: non_neg_integer()) -> {ok, pid()} | {error, term()}.
+start_link(IP, Port, N) ->
+    gen_server:start_link({local, generate_conn_name(N)}, ?MODULE, [IP, Port], []).
+
+generate_conn_name(N) ->
+    Binary = unicode:characters_to_list(io_lib:format("~p=~p", [?MODULE, N])),
+    try
+        list_to_existing_atom(Binary)
+    catch error:badarg ->
+        list_to_atom(Binary)
+    end.
 
 %% @doc Async send
 %%

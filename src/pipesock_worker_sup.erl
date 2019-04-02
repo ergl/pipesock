@@ -5,7 +5,7 @@
 
 %% API
 -export([start_link/0,
-         start_connection/2]).
+         start_connection/3]).
 
 %% Supervisor callbacks
 -export([init/1]).
@@ -35,7 +35,8 @@ init([]) ->
     {ok, {Strategy, [Worker]}}.
 
 -spec start_connection(IP :: inet:ip_address(),
-                       Port :: inet:port_number()) -> {ok, pid()}.
+                       Port :: inet:port_number(),
+                       N :: non_neg_integer()) -> {ok, pid()}.
 
-start_connection(IP, Port) ->
-    supervisor:start_child(?MODULE, [IP, Port]).
+start_connection(IP, Port, N) ->
+    supervisor:start_child(?MODULE, [IP, Port, N]).
