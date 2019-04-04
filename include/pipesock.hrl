@@ -6,4 +6,4 @@
 -define(BUF_WATERMARK, 500).
 
 %% How many bits in each message are reserved as id portion
--define(ID_BITS, 8).
+-define(ID_BITS, 16).
