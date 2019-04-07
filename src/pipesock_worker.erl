@@ -16,8 +16,6 @@
          terminate/2,
          code_change/3]).
 
--include("pipesock.hrl").
-
 %% Socket options
 %% active and deliver_term set options for receiving data
 %% packet => raw, since we're doing the framing ourselves
@@ -27,6 +25,9 @@
                     {deliver, term},
                     {packet, raw}]).
 
+%% How many bits in each message are reserved as id portion
+-define(ID_BITS, 16).
+
 %% Use the equivalent of {packet, 4} to frame the messages
 -define(FRAME(Data),
     <<(byte_size(Data)):32/big-unsigned-integer, Data/binary>>).
@@ -34,12 +35,14 @@
 -record(state, {
     socket :: gen_tcp:socket(),
     cork_timer = undefined :: timer:tref() | undefined,
-    cork_len = ?CORK_LEN :: non_neg_integer(),
+    %% How long to wait between buffer flush
+    cork_len :: non_neg_integer(),
     msg_owners = ets:new(msg_owners, [set, private]) :: ets:tid(),
 
     %% Buffer and ancillary state
     buffer = <<>> :: binary(),
-    buffer_watermark = ?BUF_WATERMARK :: non_neg_integer(),
+    %% How many messages in the buffer before we flush
+    buffer_watermark :: non_neg_integer(),
     buffer_len = 0 :: non_neg_integer(),
 
     %% Incomplete data coming from socket (since we're framing)
@@ -104,7 +107,11 @@ init([IP, Port]) ->
         {error, Reason} ->
             {stop, Reason};
         {ok, Socket} ->
-            {ok, #state{socket = Socket}}
+            CorkLen = application:get_env(pipesock, cork_len, 5),
+            BufferWatermark = application:get_env(pipesock, buf_watermark, 500),
+            {ok, #state{socket = Socket,
+                        cork_len = CorkLen,
+                        buffer_watermark = BufferWatermark}}
     end.
 
 handle_call(E, _From, S) ->
