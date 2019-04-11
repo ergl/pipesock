@@ -10,7 +10,7 @@
          send_sync/3]).
 
 %% Supervisor callbacks
--export([start_link/2]).
+-export([start_link/3]).
 
 %% gen_server callbacks
 -export([init/1,
@@ -83,9 +83,10 @@
 %%%===================================================================
 
 -spec start_link(IP :: inet:ip_address(),
-                 Port :: inet:port_number()) -> {ok, pid()} | {error, term()}.
-start_link(IP, Port) ->
-    gen_server:start_link(?MODULE, [IP, Port], []).
+                 Port :: inet:port_number(),
+                 Options :: conn_opts()) -> {ok, pid()} | {error, term()}.
+start_link(IP, Port, Options) ->
+    gen_server:start_link(?MODULE, [IP, Port, Options], []).
 
 %%%===================================================================
 %%% API
@@ -141,7 +142,7 @@ open(Ip, Port, Options) ->
 %% @doc Close the TCP connection
 -spec close(conn_handle()) -> ok.
 close(#conn_handle{conn_pid=Pid}) ->
-    gen_server:cast(Pid, stop).
+    gen_server:call(Pid, stop, infinity).
 
 %% @doc Async send
 %%
@@ -199,6 +200,9 @@ init([IP, Port, Options]) ->
 handle_call(get_ref, _From, State = #state{self_ref=Ref}) ->
     {reply, {ok, Ref}, State};
 
+handle_call(stop, _From, State) ->
+    {stop, normal, ok, State};
+
 handle_call(E, _From, S) ->
     io:format("unexpected call: ~p~n", [E]),
     {reply, ok, S}.
@@ -222,9 +226,6 @@ handle_cast({queue, Id, Msg, Callback}, State = #state{msg_owners=Owners,
     end,
     {noreply, FinalState};
 
-handle_cast(stop, S) ->
-    {stop, normal, S};
-
 handle_cast(E, S) ->
     io:format("unexpected cast: ~p~n", [E]),
     {noreply, S}.
@@ -232,12 +233,12 @@ handle_cast(E, S) ->
 handle_info(flush_buffer, State) ->
     {noreply, maybe_rearm_timer(maybe_cancel_timer(flush_buffer(State)))};
 
-handle_info({tcp, Socket, Data}, State=#state{socket=Socket}) ->
+handle_info({tcp, Socket, Data}, State=#state{socket=Socket,msg_owners=Owners,msg_id_len=IdLen,self_ref=OwnRef}) ->
     NewSlice = case decode_data(Data, State#state.message_slice) of
         {more, Rest} ->
             Rest;
         {ok, Msgs, Rest} ->
-            ok = process_messages(Msgs, State#state.msg_owners, State#state.msg_id_len),
+            ok = process_messages(Msgs, Owners, IdLen, OwnRef),
             Rest
     end,
     ok = inet:setopts(Socket, [{active, once}]),
@@ -330,21 +331,21 @@ decode_data_inner(Data, Acc) ->
 
 %% @private
 %% @doc Reply to the given owners, if any, otherwise drop on the floor
--spec process_messages([binary()], ets:tid(), non_neg_integer()) -> ok.
-process_messages([], _Owners, _IdLen) ->
+-spec process_messages([binary()], ets:tid(), non_neg_integer(), reference()) -> ok.
+process_messages([], _Owners, _IdLen, _OwnRef) ->
     ok;
 
-process_messages([Msg | Rest], Owners, IdLen) ->
+process_messages([Msg | Rest], Owners, IdLen, OwnRef) ->
     case Msg of
         <<Id:IdLen, _/binary>> ->
             case ets:take(Owners, Id) of
                 [{Id, Callback}] ->
-                    Callback(Msg),
-                    process_messages(Rest, Owners, IdLen);
+                    Callback({OwnRef, Msg}),
+                    process_messages(Rest, Owners, IdLen, OwnRef);
                 [] ->
-                    process_messages(Rest, Owners, IdLen)
+                    process_messages(Rest, Owners, IdLen, OwnRef)
             end;
 
         _ ->
-            process_messages(Rest, Owners, IdLen)
+            process_messages(Rest, Owners, IdLen, OwnRef)
     end.
