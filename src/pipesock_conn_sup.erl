@@ -1,14 +1,11 @@
 
--module(pipesock_worker_sup).
+-module(pipesock_conn_sup).
 
 -behaviour(supervisor).
 
-%% API
--export([start_link/0,
-         start_connection/2]).
-
 %% Supervisor callbacks
--export([init/1]).
+-export([start_link/0,
+         init/1]).
 
 
 %%%===================================================================
@@ -33,9 +30,3 @@ init([]) ->
                modules => [pipesock_worker]},
     Strategy = #{strategy => simple_one_for_one, intensity => 5, period => 10},
     {ok, {Strategy, [Worker]}}.
-
--spec start_connection(IP :: inet:ip_address(),
-                       Port :: inet:port_number()) -> {ok, pid()}.
-
-start_connection(IP, Port) ->
-    supervisor:start_child(?MODULE, [IP, Port]).
