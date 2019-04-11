@@ -22,11 +22,11 @@ start_link() ->
 %%%===================================================================
 
 init([]) ->
-    Worker = #{id => pipesock_worker,
-               start => {pipesock_worker, start_link, []},
+    Worker = #{id => pipesock_conn,
+               start => {pipesock_conn, start_link, []},
                restart => transient,
                shutdown => 5000,
                type => worker,
-               modules => [pipesock_worker]},
+               modules => [pipesock_conn]},
     Strategy = #{strategy => simple_one_for_one, intensity => 5, period => 10},
     {ok, {Strategy, [Worker]}}.

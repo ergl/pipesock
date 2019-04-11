@@ -1,12 +1,16 @@
--module(pipesock_worker).
+-module(pipesock_conn).
 
 -behaviour(gen_server).
 
 %% API
--export([start_link/2,
+-export([open/3,
+         close/1,
+         get_ref/1,
          send_cb/3,
-         send_sync/3,
-         close/1]).
+         send_sync/3]).
+
+%% Supervisor callbacks
+-export([start_link/2]).
 
 %% gen_server callbacks
 -export([init/1,
@@ -15,6 +19,9 @@
          handle_info/2,
          terminate/2,
          code_change/3]).
+
+%% The supervisor of this module
+-define(SUPERVISOR, pipesock_conn_sup).
 
 %% Socket options
 %% active and deliver_term set options for receiving data
@@ -37,6 +44,12 @@
     cork_timer = undefined :: timer:tref() | undefined,
     %% How long to wait between buffer flush
     cork_len :: non_neg_integer(),
+
+    %% Reference to use when replying to owners
+    %% useful for clients that have more than one connection
+    self_ref :: reference(),
+    msg_id_len :: non_neg_integer(),
+    %% ETS table mapping message ids to callbacks/pids to reply to
     msg_owners = ets:new(msg_owners, [set, private]) :: ets:tid(),
 
     %% Buffer and ancillary state
@@ -50,9 +63,23 @@
 }).
 
 -type state() :: #state{}.
+-type conn_opts() :: map().
+
+-record(conn_handle, {
+    conn_ref :: reference(),
+    conn_pid :: pid(),
+
+    %% Mandatory to have this info here to be able to match on the caller side
+    %% without validating on the gen_server side.
+    id_len :: non_neg_integer()
+}).
+
+-opaque conn_handle() :: #conn_handle{}.
+
+-export_type([conn_handle/0]).
 
 %%%===================================================================
-%%% API
+%%% Supervision tree
 %%%===================================================================
 
 -spec start_link(IP :: inet:ip_address(),
@@ -60,59 +87,117 @@
 start_link(IP, Port) ->
     gen_server:start_link(?MODULE, [IP, Port], []).
 
+%%%===================================================================
+%%% API
+%%%===================================================================
+
+%% @doc Get back the unique conn reference
+%%
+%%      The client might want this for selective receive match
+-spec get_ref(conn_handle()) -> reference().
+get_ref(#conn_handle{conn_ref=Ref}) ->
+    Ref.
+
+%% @doc Spawn a new TCP connection
+%%
+%%      Valid options are:
+%%
+%%      id_len => non_neg_integer()
+%%          Determines the length (in bits) of the id header for each message
+%%          If not supplied, the default is 16. This is mandatory if the caller
+%%          wants to receive a message back from the server. Care must be placed
+%%          so that the number of clients sharing a single connection doesn't go
+%%          over 2^id_len.
+%%
+%%          The server _must_ return this header intact.
+%%
+%%      buf_watermark => non_neg_integer()
+%%          The max number of messages sitting in the connection buffer. Once it goes
+%%          over this number, the connection will automatically flush it.
+%%
+%%      cork_len => non_neg_integer()
+%%          The max number of milis between buffer flushes.
+%%
+-spec open(Ip :: atom(),
+           Port :: inet:port_number(),
+           Options :: conn_opts()) -> {ok, conn_handle()} | {error, Reason :: term()}.
+
+open(Ip, Port, Options) ->
+    IdLen = maps:get(id_len, Options, ?ID_BITS),
+    Ret = supervisor:start_child(?SUPERVISOR, [Ip, Port, Options]),
+    case Ret of
+        {ok, Pid} ->
+            {ok, Ref} = get_conn_ref(Pid),
+            {ok, #conn_handle{conn_ref=Ref, conn_pid=Pid, id_len=IdLen}};
+
+        {error, {already_started, ChildPid}} ->
+            {ok, Ref} = get_conn_ref(ChildPid),
+            {ok, #conn_handle{conn_ref=Ref, conn_pid=ChildPid, id_len=IdLen}};
+
+        Err ->
+            Err
+    end.
+
+%% @doc Close the TCP connection
+-spec close(conn_handle()) -> ok.
+close(#conn_handle{conn_pid=Pid}) ->
+    gen_server:cast(Pid, stop).
+
 %% @doc Async send
 %%
 %%      Accepts an optional callback that is fired when a reply
 %%      to this message is delivered.
 %%
--spec send_cb(Ref :: pid(),
+-spec send_cb(conn_handle(),
               Msg :: binary(),
               Callback :: fun((binary()) -> ok)) -> ok.
 
-send_cb(Ref, <<Id:?ID_BITS, _/binary>>=Msg, Callback) ->
-    gen_server:cast(Ref, {queue, Id, Msg, Callback}).
+send_cb(#conn_handle{conn_pid=Pid, id_len=Len}, Msg, Callback) ->
+    <<Id:Len, _/binary>> = Msg,
+    gen_server:cast(Pid, {queue, Id, Msg, Callback}).
 
 %% @doc Sync send
 %%
 %%      Will return when a reply comes or `Timeout` ms pass,
 %%      whichever comes first.
 %%
--spec send_sync(Ref :: pid(),
+-spec send_sync(conn_handle(),
                 Msg :: binary(),
                 Timeout :: non_neg_integer()) -> {ok, term()}
                                                | {error, timeout}.
 
-send_sync(Ref, Msg, Timeout) ->
+send_sync(Conn=#conn_handle{conn_ref=Ref}, Msg, Timeout) ->
     Self = self(),
-    send_cb(Ref, Msg, fun(Reply) -> Self ! {ok, Reply} end),
-    receive
-        {ok, Term} ->
-            {ok, Term}
+    send_cb(Conn, Msg, fun(Reply) -> Self ! {ok, Reply} end),
+    receive {ok, {Ref, Term}} ->
+        {ok, Term}
     after Timeout ->
         {error, timeout}
     end.
-
-%% @doc Close the TCP connection
--spec close(Ref :: pid()) -> ok.
-close(Ref) ->
-    gen_server:cast(Ref, stop).
 
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
 -spec init(term()) -> {ok, state()}| {stop, term()}.
-init([IP, Port]) ->
+init([IP, Port, Options]) ->
     case gen_tcp:connect(IP, Port, ?SOCK_OPTS) of
         {error, Reason} ->
             {stop, Reason};
         {ok, Socket} ->
-            CorkLen = application:get_env(pipesock, cork_len, 5),
-            BufferWatermark = application:get_env(pipesock, buf_watermark, 500),
-            {ok, #state{socket = Socket,
+            Ref = erlang:make_ref(),
+            CorkLen = maps:get(cork_len, Options, 5),
+            BufferWatermark = maps:get(buf_watermark, Options, 500),
+            {ok, #state{self_ref = Ref,
+                        socket = Socket,
                         cork_len = CorkLen,
+                        msg_id_len = maps:get(id_len, Options, ?ID_BITS),
                         buffer_watermark = BufferWatermark}}
     end.
+
+%% @doc Get back the unique reference of this connection
+handle_call(get_ref, _From, State = #state{self_ref=Ref}) ->
+    {reply, {ok, Ref}, State};
 
 handle_call(E, _From, S) ->
     io:format("unexpected call: ~p~n", [E]),
@@ -152,7 +237,7 @@ handle_info({tcp, Socket, Data}, State=#state{socket=Socket}) ->
         {more, Rest} ->
             Rest;
         {ok, Msgs, Rest} ->
-            ok = process_messages(Msgs, State#state.msg_owners),
+            ok = process_messages(Msgs, State#state.msg_owners, State#state.msg_id_len),
             Rest
     end,
     ok = inet:setopts(Socket, [{active, once}]),
@@ -183,13 +268,20 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-%% Flushes the data buffer through the socket and reset the state
+%% @private
+-spec get_conn_ref(Pid :: pid()) -> {ok, reference()}.
+get_conn_ref(Pid) ->
+    gen_server:call(Pid, get_ref, infinity).
+
+%% @private
+%% @doc Flushes the data buffer through the socket and reset the state
 -spec flush_buffer(state()) -> state().
 flush_buffer(State = #state{socket=Socket, buffer=Buffer}) ->
     ok = gen_tcp:send(Socket, Buffer),
     State#state{buffer = <<>>, buffer_len = 0}.
 
-%% Rearms the timer if it was not yet active
+%% @private
+%% @doc Rearms the timer if it was not yet active
 -spec maybe_rearm_timer(state()) -> state().
 maybe_rearm_timer(State=#state{cork_timer = undefined, cork_len = Span}) ->
     {ok, TRef} = timer:send_after(Span, flush_buffer),
@@ -198,7 +290,8 @@ maybe_rearm_timer(State=#state{cork_timer = undefined, cork_len = Span}) ->
 maybe_rearm_timer(State=#state{cork_timer = _Ref}) ->
     State.
 
-%% Cancels the timer if it was active
+%% @private
+%% @doc Cancels the timer if it was active
 maybe_cancel_timer(State=#state{cork_timer = undefined}) ->
     State;
 
@@ -206,6 +299,7 @@ maybe_cancel_timer(State=#state{cork_timer = TRef}) ->
     timer:cancel(TRef),
     State#state{cork_timer = undefined}.
 
+%% @private
 %% @doc Recursively extract complete messages from Data, combined with Slice
 %%      Slice represents the previous message buffer, if any
 %%      Should eagerly extract messages from Data and/or Slice.
@@ -234,22 +328,23 @@ decode_data_inner(Data, Acc) ->
             {ok, Acc, Data}
     end.
 
+%% @private
 %% @doc Reply to the given owners, if any, otherwise drop on the floor
--spec process_messages([binary()], ets:tid()) -> ok.
-process_messages([], _Owners) ->
+-spec process_messages([binary()], ets:tid(), non_neg_integer()) -> ok.
+process_messages([], _Owners, _IdLen) ->
     ok;
 
-process_messages([Msg | Rest], Owners) ->
+process_messages([Msg | Rest], Owners, IdLen) ->
     case Msg of
-        <<Id:?ID_BITS, _/binary>> ->
+        <<Id:IdLen, _/binary>> ->
             case ets:take(Owners, Id) of
                 [{Id, Callback}] ->
                     Callback(Msg),
-                    process_messages(Rest, Owners);
+                    process_messages(Rest, Owners, IdLen);
                 [] ->
-                    process_messages(Rest, Owners)
+                    process_messages(Rest, Owners, IdLen)
             end;
 
         _ ->
-            process_messages(Rest, Owners)
+            process_messages(Rest, Owners, IdLen)
     end.
