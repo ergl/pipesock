@@ -3,7 +3,8 @@
 -behaviour(gen_server).
 
 %% API
--export([open/3,
+-export([open/2,
+         open/3,
          close/1,
          get_ref/1,
          send_cb/3,
@@ -98,6 +99,14 @@ start_link(IP, Port, Options) ->
 -spec get_ref(conn_handle()) -> reference().
 get_ref(#conn_handle{conn_ref=Ref}) ->
     Ref.
+
+%% @doc Spawn a new TCP connection
+%%
+%%      Same as pipesock_conn:open(Ip, Port, #{}).
+%%
+-spec open(Ip :: atom(), Port :: inet:port_number()) -> {ok, conn_handle()} | {error, Reason :: term()}.
+open(Ip, Port) ->
+    open(Ip, Port, #{}).
 
 %% @doc Spawn a new TCP connection
 %%
