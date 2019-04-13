@@ -8,6 +8,7 @@
          close/1,
          get_ref/1,
          get_len/1,
+         get_self_ip/1,
          send_cb/3,
          send_sync/3]).
 
@@ -43,6 +44,7 @@
 
 -record(state, {
     socket :: gen_tcp:socket(),
+    socket_ip :: inet:ip_address(),
     cork_timer = undefined :: timer:tref() | undefined,
     %% How long to wait between buffer flush
     cork_len :: non_neg_integer(),
@@ -70,6 +72,7 @@
 -record(conn_handle, {
     conn_ref :: reference(),
     conn_pid :: pid(),
+    conn_ip :: inet:ip_address(),
 
     %% Mandatory to have this info here to be able to match on the caller side
     %% without validating on the gen_server side.
@@ -107,6 +110,15 @@ get_ref(#conn_handle{conn_ref=Ref}) ->
 -spec get_len(conn_handle()) -> non_neg_integer().
 get_len(#conn_handle{id_len=Len}) ->
     Len.
+
+%% @doc Get the local IP of the connection
+%%
+%%      The client might want this to generate machine-local
+%%      identifiers
+%%
+-spec get_self_ip(conn_handle()) -> inet:ip_address().
+get_self_ip(#conn_handle{conn_ip=Ip}) ->
+    Ip.
 
 %% @doc Spawn a new TCP connection
 %%
@@ -146,7 +158,8 @@ open(Ip, Port, Options) ->
     case Ret of
         {ok, Pid} ->
             {ok, Ref} = get_conn_ref(Pid),
-            {ok, #conn_handle{conn_ref=Ref, conn_pid=Pid, id_len=IdLen}};
+            {ok, LocalIp} = get_conn_ip(Pid),
+            {ok, #conn_handle{conn_ref=Ref, conn_pid=Pid, id_len=IdLen, conn_ip=LocalIp}};
 
         {error, {already_started, ChildPid}} ->
             {ok, Ref} = get_conn_ref(ChildPid),
@@ -203,11 +216,13 @@ init([IP, Port, Options]) ->
         {error, Reason} ->
             {stop, Reason};
         {ok, Socket} ->
+            {ok, {LocalIP, _LocalPort}} = inet:sockname(Socket),
             Ref = erlang:make_ref(),
             CorkLen = maps:get(cork_len, Options, 5),
             BufferWatermark = maps:get(buf_watermark, Options, 500),
             {ok, #state{self_ref = Ref,
                         socket = Socket,
+                        socket_ip=LocalIP,
                         cork_len = CorkLen,
                         msg_id_len = maps:get(id_len, Options, ?ID_BITS),
                         buffer_watermark = BufferWatermark}}
@@ -290,6 +305,11 @@ code_change(_OldVsn, State, _Extra) ->
 -spec get_conn_ref(Pid :: pid()) -> {ok, reference()}.
 get_conn_ref(Pid) ->
     gen_server:call(Pid, get_ref, infinity).
+
+%% @private
+-spec get_conn_ip(Pid :: pid()) -> {ok, inet:ip_address()}.
+get_conn_ip(Pid) ->
+    gen_server:call(Pid, get_ip, infinity).
 
 %% @private
 %% @doc Flushes the data buffer through the socket and reset the state
