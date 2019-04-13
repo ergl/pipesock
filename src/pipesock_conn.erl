@@ -7,6 +7,7 @@
          open/3,
          close/1,
          get_ref/1,
+         get_len/1,
          send_cb/3,
          send_sync/3]).
 
@@ -99,6 +100,13 @@ start_link(IP, Port, Options) ->
 -spec get_ref(conn_handle()) -> reference().
 get_ref(#conn_handle{conn_ref=Ref}) ->
     Ref.
+
+%% @doc Get back the message identifier length
+%%
+%%      The client might want this to wrap messages
+-spec get_len(conn_handle()) -> non_neg_integer().
+get_len(#conn_handle{id_len=Len}) ->
+    Len.
 
 %% @doc Spawn a new TCP connection
 %%
