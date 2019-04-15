@@ -125,7 +125,9 @@ get_self_ip(#conn_handle{conn_ip=Ip}) ->
 %%
 %%      Same as pipesock_conn:open(Ip, Port, #{}).
 %%
--spec open(Ip :: atom(), Port :: inet:port_number()) -> {ok, conn_handle()} | {error, Reason :: term()}.
+-spec open(Ip :: atom(),
+           Port :: inet:port_number()) -> {ok, conn_handle()}
+                                        | {error, Reason :: term()}.
 open(Ip, Port) ->
     open(Ip, Port, #{}).
 
@@ -143,15 +145,17 @@ open(Ip, Port) ->
 %%          The server _must_ return this header intact.
 %%
 %%      buf_watermark => non_neg_integer()
-%%          The max number of messages sitting in the connection buffer. Once it goes
-%%          over this number, the connection will automatically flush it.
+%%          The max number of messages sitting in the connection buffer.
+%%          Once it goes over this number, the connection will automatically
+%%          flush it.
 %%
 %%      cork_len => non_neg_integer()
 %%          The max number of milis between buffer flushes.
 %%
 -spec open(Ip :: atom(),
            Port :: inet:port_number(),
-           Options :: conn_opts()) -> {ok, conn_handle()} | {error, Reason :: term()}.
+           Options :: conn_opts()) -> {ok, conn_handle()}
+                                    | {error, Reason :: term()}.
 
 open(Ip, Port, Options) ->
     IdLen = maps:get(id_len, Options, ?ID_BITS),
@@ -160,11 +164,14 @@ open(Ip, Port, Options) ->
         {ok, Pid} ->
             {ok, Ref} = get_conn_ref(Pid),
             {ok, LocalIp} = get_conn_ip(Pid),
-            {ok, #conn_handle{conn_ref=Ref, conn_pid=Pid, id_len=IdLen, conn_ip=LocalIp}};
+            {ok, #conn_handle{conn_ref=Ref, conn_pid=Pid,
+                              id_len=IdLen, conn_ip=LocalIp}};
 
         {error, {already_started, ChildPid}} ->
             {ok, Ref} = get_conn_ref(ChildPid),
-            {ok, #conn_handle{conn_ref=Ref, conn_pid=ChildPid, id_len=IdLen}};
+            {ok, LocalIp} = get_conn_ip(ChildPid),
+            {ok, #conn_handle{conn_ref=Ref, conn_pid=ChildPid,
+                              id_len=IdLen, conn_ip=LocalIp}};
 
         Err ->
             Err
@@ -260,7 +267,11 @@ handle_cast(E, S) ->
 handle_info(flush_buffer, State) ->
     {noreply, maybe_rearm_timer(maybe_cancel_timer(flush_buffer(State)))};
 
-handle_info({tcp, Socket, Data}, State=#state{socket=Socket,msg_owners=Owners,msg_id_len=IdLen,self_ref=OwnRef}) ->
+handle_info({tcp, Socket, Data}, State=#state{socket=Socket,
+                                              msg_owners=Owners,
+                                              msg_id_len=IdLen,
+                                              self_ref=OwnRef}) ->
+
     NewSlice = case decode_data(Data, State#state.message_slice) of
         {more, Rest} ->
             Rest;
@@ -378,7 +389,10 @@ decode_data_inner(Data, Acc) ->
 
 %% @private
 %% @doc Reply to the given owners, if any, otherwise drop on the floor
--spec process_messages([binary()], ets:tid(), non_neg_integer(), reference()) -> ok.
+-spec process_messages(Msgs :: [binary()],
+                       Owners :: ets:tid(),
+                       IdLen :: non_neg_integer(),
+                       OwnRef :: reference()) -> ok.
 process_messages([], _Owners, _IdLen, _OwnRef) ->
     ok;
 
