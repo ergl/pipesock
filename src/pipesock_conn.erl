@@ -189,9 +189,11 @@ close(#conn_handle{conn_pid=Pid}) ->
 %%
 -spec send_cb(conn_handle(),
               Msg :: binary(),
-              Callback :: fun((binary()) -> ok)) -> ok.
+              Callback :: fun((reference(), binary()) -> ok)) -> ok.
 
-send_cb(#conn_handle{conn_pid=Pid, id_len=Len}, Msg, Callback) ->
+send_cb(#conn_handle{conn_pid=Pid, id_len=Len},
+        Msg, Callback) when is_function(Callback, 2) ->
+
     <<Id:Len, _/binary>> = Msg,
     gen_server:cast(Pid, {queue, Id, Msg, Callback}).
 
@@ -207,8 +209,8 @@ send_cb(#conn_handle{conn_pid=Pid, id_len=Len}, Msg, Callback) ->
 
 send_sync(Conn=#conn_handle{conn_ref=Ref}, Msg, Timeout) ->
     Self = self(),
-    send_cb(Conn, Msg, fun(Reply) -> Self ! {ok, Reply} end),
-    receive {ok, {Ref, Term}} ->
+    send_cb(Conn, Msg, fun(ConnRef, Reply) -> Self ! {ConnRef, Reply} end),
+    receive {Ref, Term} ->
         {ok, Term}
     after Timeout ->
         {error, timeout}
@@ -401,7 +403,7 @@ process_messages([Msg | Rest], Owners, IdLen, OwnRef) ->
         <<Id:IdLen, _/binary>> ->
             case ets:take(Owners, Id) of
                 [{Id, Callback}] ->
-                    Callback({OwnRef, Msg}),
+                    _ = spawn(fun() -> Callback(OwnRef, Msg) end),
                     process_messages(Rest, Owners, IdLen, OwnRef);
                 [] ->
                     process_messages(Rest, Owners, IdLen, OwnRef)
