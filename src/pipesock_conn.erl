@@ -237,7 +237,7 @@ init([IP, Port, Options]) ->
             BufferWatermark = maps:get(buf_watermark, Options, 500),
             {ok, #state{self_ref = Ref,
                         socket = Socket,
-                        socket_ip=LocalIP,
+                        socket_ip = LocalIP,
                         cork_len = CorkLen,
                         msg_id_len = maps:get(id_len, Options, ?ID_BITS),
                         buffer_watermark = BufferWatermark}}
@@ -246,6 +246,9 @@ init([IP, Port, Options]) ->
 %% @doc Get back the unique reference of this connection
 handle_call(get_ref, _From, State = #state{self_ref=Ref}) ->
     {reply, {ok, Ref}, State};
+
+handle_call(get_ip, _From, State = #state{socket_ip=Ip}) ->
+    {reply, {ok, Ip}, State};
 
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
