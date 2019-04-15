@@ -10,7 +10,8 @@
          get_len/1,
          get_self_ip/1,
          send_cb/3,
-         send_sync/3]).
+         send_sync/3,
+         send_and_forget/2]).
 
 %% Supervisor callbacks
 -export([start_link/3]).
@@ -206,6 +207,11 @@ send_sync(Conn=#conn_handle{conn_ref=Ref}, Msg, Timeout) ->
         {error, timeout}
     end.
 
+%% @doc Async send, where we don't expect a reply
+-spec send_and_forget(conn_handle(), Msg :: binary()) -> ok.
+send_and_forget(#conn_handle{conn_pid=Pid}, Msg) ->
+    gen_server:cast(Pid, {queue, Msg}).
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -239,24 +245,13 @@ handle_call(E, _From, S) ->
     io:format("unexpected call: ~p~n", [E]),
     {reply, ok, S}.
 
-handle_cast({queue, Id, Msg, Callback}, State = #state{msg_owners=Owners,
-                                                       buffer=Buffer,
-                                                       buffer_len=Len,
-                                                       buffer_watermark=WM}) ->
+handle_cast({queue, Msg}, State) ->
+    {noreply, enqueue_message(Msg, State)};
 
-    NewLen = Len + 1,
-    NewBuffer = <<Buffer/binary, (?FRAME(Msg))/binary>>,
-
+handle_cast({queue, Id, Msg, Callback}, State = #state{msg_owners=Owners}) ->
     %% Register callback, overriding any old callbacks
     true = ets:insert(Owners, {Id, Callback}),
-    NewState = State#state{buffer=NewBuffer, buffer_len=NewLen},
-    FinalState = case NewLen =:= WM of
-        true ->
-            maybe_cancel_timer(flush_buffer(NewState));
-        false ->
-            maybe_rearm_timer(NewState)
-    end,
-    {noreply, FinalState};
+    {noreply, enqueue_message(Msg, State)};
 
 handle_cast(E, S) ->
     io:format("unexpected cast: ~p~n", [E]),
@@ -310,6 +305,21 @@ get_conn_ref(Pid) ->
 -spec get_conn_ip(Pid :: pid()) -> {ok, inet:ip_address()}.
 get_conn_ip(Pid) ->
     gen_server:call(Pid, get_ip, infinity).
+
+%% @doc Enqueue a message in the buffer, and update timer and flush state.
+-spec enqueue_message(Msg :: binary(), State :: state()) -> state().
+enqueue_message(Msg, State = #state{buffer=Buffer,
+                                    buffer_len=Len,
+                                    buffer_watermark=WM}) ->
+    NewLen = Len + 1,
+    NewBuffer = <<Buffer/binary, (?FRAME(Msg))/binary>>,
+    NewState = State#state{buffer=NewBuffer, buffer_len=NewLen},
+    case NewLen =:= WM of
+        true ->
+            maybe_cancel_timer(flush_buffer(NewState));
+        false ->
+            maybe_rearm_timer(NewState)
+    end.
 
 %% @private
 %% @doc Flushes the data buffer through the socket and reset the state
