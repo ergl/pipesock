@@ -406,6 +406,7 @@ process_messages([Msg | Rest], Owners, IdLen, OwnRef) ->
         <<Id:IdLen, _/binary>> ->
             case ets:take(Owners, Id) of
                 [{Id, Callback}] ->
+                    %% TODO(borja): Measure overhead
                     _ = spawn(fun() -> Callback(OwnRef, Msg) end),
                     process_messages(Rest, Owners, IdLen, OwnRef);
                 [] ->
