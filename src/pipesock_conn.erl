@@ -46,6 +46,7 @@
 -record(state, {
     socket :: gen_tcp:socket(),
     socket_ip :: inet:ip_address(),
+    %% TODO(borja): Add option to disable timer on fast networks
     cork_timer = undefined :: timer:tref() | undefined,
     %% How long to wait between buffer flush
     cork_len :: non_neg_integer(),
