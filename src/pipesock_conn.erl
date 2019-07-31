@@ -188,6 +188,11 @@ close(#conn_handle{conn_pid=Pid}) ->
 %%      Accepts an optional callback that is fired when a reply
 %%      to this message is delivered.
 %%
+%%      The callback must accept two arguments. The first is the
+%%      connection reference (in case one wants to re-use the callback
+%%      with different connections), and the reply to this message as
+%%      second argument.
+%%
 -spec send_cb(conn_handle(),
               Msg :: binary(),
               Callback :: fun((reference(), binary()) -> ok)) -> ok.
@@ -255,19 +260,22 @@ handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
 
 handle_call(E, _From, S) ->
-    io:format("unexpected call: ~p~n", [E]),
+    io:fwrite(standard_error, "unexpected call: ~p~n", [E]),
     {reply, ok, S}.
 
 handle_cast({queue, Msg}, State) ->
     {noreply, enqueue_message(Msg, State)};
 
 handle_cast({queue, Id, Msg, Callback}, State = #state{msg_owners=Owners}) ->
-    %% Register callback, overriding any old callbacks
-    true = ets:insert(Owners, {Id, Callback}),
+    %% Register callback
+    %% Id should be unique. This returns false if `Id` exists
+    %% in the owners table, and should crash.
+    %% Callers should deal with lost state if this happens.
+    true = ets:insert_new(Owners, {Id, Callback}),
     {noreply, enqueue_message(Msg, State)};
 
 handle_cast(E, S) ->
-    io:format("unexpected cast: ~p~n", [E]),
+    io:fwrite(standard_error, "unexpected cast: ~p~n", [E]),
     {noreply, S}.
 
 handle_info(flush_buffer, State) ->
@@ -298,7 +306,7 @@ handle_info(timeout, State) ->
     {stop, normal, State};
 
 handle_info(E, S) ->
-    io:format("unexpected info: ~p~n", [E]),
+    io:fwrite(standard_error, "unexpected info: ~p~n", [E]),
     {noreply, S}.
 
 terminate(_Reason, #state{socket = Sock, msg_owners = Owners}) ->
@@ -410,9 +418,11 @@ process_messages([Msg | Rest], Owners, IdLen, OwnRef) ->
                     Callback(OwnRef, Msg),
                     process_messages(Rest, Owners, IdLen, OwnRef);
                 [] ->
+                    %% TODO(borja): Deal with unmatched messages?
                     process_messages(Rest, Owners, IdLen, OwnRef)
             end;
 
         _ ->
+            %% TODO(borja): Deal with malformed messages?
             process_messages(Rest, Owners, IdLen, OwnRef)
     end.
