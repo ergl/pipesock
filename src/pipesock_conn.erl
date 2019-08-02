@@ -281,12 +281,7 @@ handle_cast({queue, Id, Msg, Callback}, State = #state{msg_owners=Owners}) ->
     %% Id should be unique. This returns false if `Id` exists
     %% in the owners table, and should crash.
     %% Callers should deal with lost state if this happens.
-    true = case ets:insert_new(Owners, {Id, Callback}) of
-        true -> true;
-        false ->
-            io:fwrite(standard_error, "~p:~p non-unique message ~p~n", [?MODULE, ?FUNCTION_NAME, Id]),
-            false
-    end,
+    true = ets:insert_new(Owners, {Id, Callback}),
     {noreply, enqueue_message(Msg, State)};
 
 handle_cast(E, S) ->
