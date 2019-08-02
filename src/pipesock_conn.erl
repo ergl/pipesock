@@ -70,6 +70,7 @@
 
 -type state() :: #state{}.
 -type conn_opts() :: map().
+-type conn_timeout() :: non_neg_integer() | infinity.
 
 -record(conn_handle, {
     conn_ref :: reference(),
@@ -83,7 +84,7 @@
 
 -opaque conn_handle() :: #conn_handle{}.
 
--export_type([conn_handle/0]).
+-export_type([conn_handle/0, conn_timeout/0]).
 
 %%%===================================================================
 %%% Supervision tree
@@ -206,16 +207,25 @@ send_cb(#conn_handle{conn_pid=Pid, id_len=Len},
 %% @doc Sync send
 %%
 %%      Will return when a reply comes or `Timeout` ms pass,
-%%      whichever comes first.
+%%      whichever comes first. Set `Timeout` to infinity to
+%%      wait forever.
 %%
 -spec send_sync(conn_handle(),
                 Msg :: binary(),
-                Timeout :: non_neg_integer()) -> {ok, term()}
-                                               | {error, timeout}.
+                Timeout :: conn_timeout()) -> {ok, term()}
+                                            | {error, timeout}.
 
 send_sync(Conn=#conn_handle{conn_ref=Ref}, Msg, Timeout) ->
     Self = self(),
     send_cb(Conn, Msg, fun(ConnRef, Reply) -> Self ! {ConnRef, Reply} end),
+    send_sync_recv(Ref, Timeout).
+
+-spec send_sync_recv(reference(), conn_timeout()) -> {ok, term()}
+                                                   | {error, timeout}.
+send_sync_recv(Ref, infinity) ->
+    receive {Ref, Term} -> {ok, Term} end;
+
+send_sync_recv(Ref, Timeout) ->
     receive {Ref, Term} ->
         {ok, Term}
     after Timeout ->
