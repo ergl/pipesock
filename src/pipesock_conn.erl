@@ -36,19 +36,26 @@
                     {deliver, term},
                     {packet, raw}]).
 
+%% Default connection values, can be changed by the client.
+
 %% How many bits in each message are reserved as id portion
 -define(ID_BITS, 16).
+%% How many milis to wait to flush a buffer after first send
+-define(CORK_LEN, 5).
+%% Max number of messages waiting on queue before sending
+-define(BUFFER_WATERMARK, 500).
 
 %% Use the equivalent of {packet, 4} to frame the messages
 -define(FRAME(Data),
     <<(byte_size(Data)):32/big-unsigned-integer, Data/binary>>).
 
+%% @doc Internal state of the connection
 -record(state, {
     socket :: gen_tcp:socket(),
     socket_ip :: inet:ip_address(),
     %% TODO(borja): Add option to disable timer on fast networks
     cork_timer = undefined :: timer:tref() | undefined,
-    %% How long to wait between buffer flush
+    %% How many ms to wait between buffer flushes
     cork_len :: non_neg_integer(),
 
     %% Reference to use when replying to owners
@@ -72,6 +79,7 @@
 -type conn_opts() :: map().
 -type conn_timeout() :: non_neg_integer() | infinity.
 
+%% @doc Client-facing structure representing a connection
 -record(conn_handle, {
     conn_ref :: reference(),
     conn_pid :: pid(),
@@ -249,8 +257,8 @@ init([IP, Port, Options]) ->
         {ok, Socket} ->
             {ok, {LocalIP, _LocalPort}} = inet:sockname(Socket),
             Ref = erlang:make_ref(),
-            CorkLen = maps:get(cork_len, Options, 5),
-            BufferWatermark = maps:get(buf_watermark, Options, 500),
+            CorkLen = maps:get(cork_len, Options, ?CORK_LEN),
+            BufferWatermark = maps:get(buf_watermark, Options, ?BUFFER_WATERMARK),
             {ok, #state{self_ref = Ref,
                         socket = Socket,
                         socket_ip = LocalIP,
@@ -274,6 +282,7 @@ handle_call(E, _From, S) ->
     {reply, ok, S}.
 
 handle_cast({queue, Msg}, State) ->
+    %% Queue without registering callbacks, useful for "send and forget" messages
     {noreply, enqueue_message(Msg, State)};
 
 handle_cast({queue, Id, Msg, Callback}, State = #state{msg_owners=Owners}) ->
