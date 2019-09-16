@@ -190,7 +190,7 @@ open(Ip, Port, Options) ->
 %% @doc Close the TCP connection
 -spec close(conn_handle()) -> ok.
 close(#conn_handle{conn_pid=Pid}) ->
-    gen_server:call(Pid, stop, infinity).
+    gen_server:stop(Pid).
 
 %% @doc Async send
 %%
@@ -298,7 +298,9 @@ handle_cast(E, S) ->
     {noreply, S}.
 
 handle_info(flush_buffer, State) ->
-    {noreply, maybe_rearm_timer(maybe_cancel_timer(flush_buffer(State)))};
+    %% Cork timer is up, flush the buffer and wait for another message
+    %% to be enqueued.
+    {noreply, maybe_cancel_timer(flush_buffer(State))};
 
 handle_info({tcp, Socket, Data}, State=#state{socket=Socket,
                                               msg_owners=Owners,
@@ -328,9 +330,10 @@ handle_info(E, S) ->
     io:fwrite(standard_error, "unexpected info: ~p~n", [E]),
     {noreply, S}.
 
-terminate(_Reason, #state{socket = Sock, msg_owners = Owners}) ->
+terminate(_Reason, #state{socket = Sock, msg_owners = Owners, cork_timer = Timer}) ->
     ok = gen_tcp:close(Sock),
     true = ets:delete(Owners),
+    ok = maybe_cancel(Timer),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -360,8 +363,12 @@ enqueue_message(Msg, State = #state{buffer=Buffer,
     NewState = State#state{buffer=NewBuffer, buffer_len=NewLen},
     case NewLen =:= WM of
         true ->
+            %% Flush the buffer when the watermark is reached.
+            %% If the cork timer was active, cancel it.
             maybe_cancel_timer(flush_buffer(NewState));
         false ->
+            %% The cork timer starts as soon as the first message
+            %% is enqueued. After that, leave it alone.
             maybe_rearm_timer(NewState)
     end.
 
@@ -390,6 +397,13 @@ maybe_cancel_timer(State=#state{cork_timer = undefined}) ->
 maybe_cancel_timer(State=#state{cork_timer = TRef}) ->
     timer:cancel(TRef),
     State#state{cork_timer = undefined}.
+
+%% @private
+-spec maybe_cancel(timer:tref() | undefined) -> ok.
+maybe_cancel(undefined) -> ok;
+maybe_cancel(Timer) ->
+    {ok, cancel} = timer:cancel(Timer),
+    ok.
 
 %% @private
 %% @doc Recursively extract complete messages from Data, combined with Slice
