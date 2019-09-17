@@ -242,8 +242,9 @@ send_sync_recv(Ref, Timeout) ->
 
 %% @doc Async send, where we don't expect a reply
 -spec send_and_forget(conn_handle(), Msg :: binary()) -> ok.
-send_and_forget(#conn_handle{conn_pid=Pid}, Msg) ->
-    gen_server:call(Pid, {queue, Msg}, infinity).
+send_and_forget(#conn_handle{conn_pid=Pid, id_len=Len}, Msg) ->
+    <<Id:Len, _/binary>> = Msg,
+    gen_server:cast(Pid, {queue, Id, Msg}).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -274,10 +275,6 @@ handle_call(get_ref, _From, State = #state{self_ref=Ref}) ->
 handle_call(get_ip, _From, State = #state{socket_ip=Ip}) ->
     {reply, {ok, Ip}, State};
 
-handle_call({queue, Msg}, _From, State) ->
-    %% Queue without registering callbacks, useful for "send and forget" messages
-    {reply, ok, enqueue_message(Msg, State)};
-
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
 
@@ -285,13 +282,18 @@ handle_call(E, _From, S) ->
     io:fwrite(standard_error, "unexpected call: ~p~n", [E]),
     {reply, ok, S}.
 
+handle_cast({queue, Id, Msg}, State) ->
+    %% Queue without registering callbacks, useful for "send and forget" messages
+    lager:info("acked cast msg ~p", [Id]),
+    {noreply, enqueue_message(Msg, State)};
+
 handle_cast({queue, Id, Msg, Callback}, State = #state{msg_owners=Owners}) ->
     %% Register callback
     %% Id should be unique. This returns false if `Id` exists
     %% in the owners table, and should crash.
     %% Callers should deal with lost state if this happens.
-    lager:info("acked msg ~p", [Id]),
     true = ets:insert_new(Owners, {Id, Callback}),
+    lager:info("acked sync msg ~p", [Id]),
     {noreply, enqueue_message(Msg, State)};
 
 handle_cast(E, S) ->
