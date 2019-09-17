@@ -290,6 +290,7 @@ handle_cast({queue, Id, Msg, Callback}, State = #state{msg_owners=Owners}) ->
     %% Id should be unique. This returns false if `Id` exists
     %% in the owners table, and should crash.
     %% Callers should deal with lost state if this happens.
+    lager:info("acked msg ~p", [Id]),
     true = ets:insert_new(Owners, {Id, Callback}),
     {noreply, enqueue_message(Msg, State)};
 
@@ -451,11 +452,13 @@ process_messages([Msg | Rest], Owners, IdLen, OwnRef) ->
                     Callback(OwnRef, Msg),
                     process_messages(Rest, Owners, IdLen, OwnRef);
                 [] ->
+                    lager:warning("missing matching callback id ~p", [Id]),
                     %% TODO(borja): Deal with unmatched messages?
                     process_messages(Rest, Owners, IdLen, OwnRef)
             end;
 
         _ ->
             %% TODO(borja): Deal with malformed messages?
+            lager:warning("received malformed msg"),
             process_messages(Rest, Owners, IdLen, OwnRef)
     end.
