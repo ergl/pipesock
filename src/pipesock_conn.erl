@@ -11,7 +11,8 @@
          get_self_ip/1,
          send_cb/3,
          send_sync/3,
-         send_and_forget/2]).
+         send_and_forget/2,
+         send_bypass/2]).
 
 %% Supervisor callbacks
 -export([start_link/3]).
@@ -246,6 +247,11 @@ send_and_forget(#conn_handle{conn_pid=Pid, id_len=Len}, Msg) ->
     <<Id:Len, _/binary>> = Msg,
     gen_server:cast(Pid, {queue, Id, Msg}).
 
+%% @doc Send the message as soon as possible, ignore batching or multiplexing
+send_bypass(#conn_handle{conn_pid=Pid, id_len=Len}, Msg) ->
+    <<Id:Len, _/binary>> = Msg,
+    gen_server:cast(Pid, {send_bypass, Id, Msg}).
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -281,6 +287,11 @@ handle_call(stop, _From, State) ->
 handle_call(E, _From, S) ->
     io:fwrite(standard_error, "unexpected call: ~p~n", [E]),
     {reply, ok, S}.
+
+handle_cast({send_bypass, Id, Msg}, State) ->
+    ok = gen_tcp:send(State#state.socket, ?FRAME(Msg)),
+    lager:info("acked bypass msg ~p", [Id]),
+    {noreply, State};
 
 handle_cast({queue, Id, Msg}, State) ->
     %% Queue without registering callbacks, useful for "send and forget" messages
