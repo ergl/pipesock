@@ -11,8 +11,7 @@
          get_self_ip/1,
          send_cb/3,
          send_sync/3,
-         send_and_forget/2,
-         send_bypass/2]).
+         send_and_forget/2]).
 
 %% Supervisor callbacks
 -export([start_link/3]).
@@ -243,14 +242,8 @@ send_sync_recv(Ref, Timeout) ->
 
 %% @doc Async send, where we don't expect a reply
 -spec send_and_forget(conn_handle(), Msg :: binary()) -> ok.
-send_and_forget(#conn_handle{conn_pid=Pid, id_len=Len}, Msg) ->
-    <<Id:Len, _/binary>> = Msg,
-    gen_server:cast(Pid, {queue, Id, Msg}).
-
-%% @doc Send the message as soon as possible, ignore batching or multiplexing
-send_bypass(#conn_handle{conn_pid=Pid, id_len=Len}, Msg) ->
-    <<Id:Len, _/binary>> = Msg,
-    gen_server:cast(Pid, {send_bypass, Id, Msg}).
+send_and_forget(#conn_handle{conn_pid=Pid}, Msg) ->
+    gen_server:cast(Pid, {queue, Msg}).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -285,17 +278,11 @@ handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
 
 handle_call(E, _From, S) ->
-    io:fwrite(standard_error, "unexpected call: ~p~n", [E]),
+    lager:warning("unexpected call: ~p~n", [E]),
     {reply, ok, S}.
 
-handle_cast({send_bypass, Id, Msg}, State) ->
-    ok = gen_tcp:send(State#state.socket, ?FRAME(Msg)),
-    lager:info("acked bypass msg ~p", [Id]),
-    {noreply, State};
-
-handle_cast({queue, Id, Msg}, State) ->
+handle_cast({queue, Msg}, State) ->
     %% Queue without registering callbacks, useful for "send and forget" messages
-    lager:info("acked cast msg ~p", [Id]),
     {noreply, enqueue_message(Msg, State)};
 
 handle_cast({queue, Id, Msg, Callback}, State = #state{msg_owners=Owners}) ->
@@ -304,11 +291,10 @@ handle_cast({queue, Id, Msg, Callback}, State = #state{msg_owners=Owners}) ->
     %% in the owners table, and should crash.
     %% Callers should deal with lost state if this happens.
     true = ets:insert_new(Owners, {Id, Callback}),
-    lager:info("acked sync msg ~p", [Id]),
     {noreply, enqueue_message(Msg, State)};
 
 handle_cast(E, S) ->
-    io:fwrite(standard_error, "unexpected cast: ~p~n", [E]),
+    lager:warning("unexpected cast: ~p~n", [E]),
     {noreply, S}.
 
 handle_info(flush_buffer, State) ->
@@ -341,7 +327,7 @@ handle_info(timeout, State) ->
     {stop, normal, State};
 
 handle_info(E, S) ->
-    io:fwrite(standard_error, "unexpected info: ~p~n", [E]),
+    lager:warning("unexpected info: ~p~n", [E]),
     {noreply, S}.
 
 terminate(_Reason, #state{socket = Sock, msg_owners = Owners, cork_timer = Timer}) ->
