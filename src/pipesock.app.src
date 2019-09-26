@@ -1,6 +1,6 @@
 {application, pipesock,
  [{description, "An OTP application"},
-  {vsn, "0.8.3"},
+  {vsn, "0.8.4"},
   {registered, []},
   {mod, {pipesock_app, []}},
   {applications, [kernel,
