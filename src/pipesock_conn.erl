@@ -278,7 +278,7 @@ handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
 
 handle_call(E, _From, S) ->
-    lager:warning("unexpected call: ~p~n", [E]),
+    logger:warning("unexpected call: ~p~n", [E]),
     {reply, ok, S}.
 
 handle_cast({queue, Msg}, State) ->
@@ -294,7 +294,7 @@ handle_cast({queue, Id, Msg, Callback}, State = #state{msg_owners=Owners}) ->
     {noreply, enqueue_message(Msg, State)};
 
 handle_cast(E, S) ->
-    lager:warning("unexpected cast: ~p~n", [E]),
+    logger:warning("unexpected cast: ~p~n", [E]),
     {noreply, S}.
 
 handle_info(flush_buffer, State) ->
@@ -327,7 +327,7 @@ handle_info(timeout, State) ->
     {stop, normal, State};
 
 handle_info(E, S) ->
-    lager:warning("unexpected info: ~p~n", [E]),
+    logger:warning("unexpected info: ~p~n", [E]),
     {noreply, S}.
 
 terminate(_Reason, #state{socket = Sock, msg_owners = Owners, cork_timer = Timer}) ->
@@ -451,13 +451,13 @@ process_messages([Msg | Rest], Owners, IdLen, OwnRef) ->
                     Callback(OwnRef, Msg),
                     process_messages(Rest, Owners, IdLen, OwnRef);
                 [] ->
-                    lager:warning("missing matching callback id ~p", [Id]),
+                    logger:warning("missing matching callback id ~p", [Id]),
                     %% TODO(borja): Deal with unmatched messages?
                     process_messages(Rest, Owners, IdLen, OwnRef)
             end;
 
         _ ->
             %% TODO(borja): Deal with malformed messages?
-            lager:warning("received malformed msg"),
+            logger:warning("received malformed msg"),
             process_messages(Rest, Owners, IdLen, OwnRef)
     end.

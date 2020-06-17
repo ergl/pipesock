@@ -15,6 +15,9 @@ compile:
 rel: compile
 	$(REBAR) release
 
+relclean:
+	rm -rf _build/default/rel
+
 clean: packageclean
 	$(REBAR) clean
 

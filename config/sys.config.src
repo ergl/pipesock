@@ -1,9 +1,14 @@
 [
-  {sasl, [
-    {sasl_error_logger, {file, "log/sasl-error.log"}},
-    {errlog_type, error},
-    {error_logger_mf_dir, "log/sasl"},
-    {error_logger_mf_maxbytes, 10485760},
-    {error_logger_mf_maxfiles, 5}
-  ]}
+  {pipesock, []},
+
+  {kernel, [
+    {logger, [
+      {handler, default, logger_std_h,
+        #{level => info,
+          formatter => {logger_formatter, #{single_line => false, max_size => 2048}},
+          config => #{type => standard_io}}}
+    ]},
+
+    {logger_level, info}
+    ]}
 ].
