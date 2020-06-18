@@ -40,10 +40,8 @@
 
 %% How many bits in each message are reserved as id portion
 -define(ID_BITS, 16).
-%% How many milis to wait to flush a buffer after first send
+%% How many milis to wait to flush the buffer
 -define(CORK_LEN, 5).
-%% Max number of messages waiting on queue before sending
--define(BUFFER_WATERMARK, 500).
 
 %% Use the equivalent of {packet, 4} to frame the messages
 -define(FRAME(Data),
@@ -54,7 +52,7 @@
     socket :: gen_tcp:socket(),
     socket_ip :: inet:ip_address(),
     %% TODO(borja): Add option to disable timer on fast networks
-    cork_timer = undefined :: timer:tref() | undefined,
+    cork_timer :: timer:tref(),
     %% How many ms to wait between buffer flushes
     cork_len :: non_neg_integer(),
 
@@ -67,9 +65,6 @@
 
     %% Buffer and ancillary state
     buffer = <<>> :: binary(),
-    %% How many messages in the buffer before we flush
-    buffer_watermark :: non_neg_integer(),
-    buffer_len = 0 :: non_neg_integer(),
 
     %% Incomplete data coming from socket (since we're framing)
     message_slice = <<>> :: binary()
@@ -153,11 +148,6 @@ open(Ip, Port) ->
 %%          over 2^id_len.
 %%
 %%          The server _must_ return this header intact.
-%%
-%%      buf_watermark => non_neg_integer()
-%%          The max number of messages sitting in the connection buffer.
-%%          Once it goes over this number, the connection will automatically
-%%          flush it.
 %%
 %%      cork_len => non_neg_integer()
 %%          The max number of milis between buffer flushes.
@@ -258,13 +248,13 @@ init([IP, Port, Options]) ->
             {ok, {LocalIP, _LocalPort}} = inet:sockname(Socket),
             Ref = erlang:make_ref(),
             CorkLen = maps:get(cork_len, Options, ?CORK_LEN),
-            BufferWatermark = maps:get(buf_watermark, Options, ?BUFFER_WATERMARK),
+            {ok, TRef} = timer:send_interval(CorkLen, flush_buffer),
             {ok, #state{self_ref = Ref,
                         socket = Socket,
                         socket_ip = LocalIP,
+                        cork_timer=TRef,
                         cork_len = CorkLen,
-                        msg_id_len = maps:get(id_len, Options, ?ID_BITS),
-                        buffer_watermark = BufferWatermark}}
+                        msg_id_len = maps:get(id_len, Options, ?ID_BITS)}}
     end.
 
 %% @doc Get back the unique reference of this connection
@@ -298,9 +288,8 @@ handle_cast(E, S) ->
     {noreply, S}.
 
 handle_info(flush_buffer, State) ->
-    %% Cork timer is up, flush the buffer and wait for another message
-    %% to be enqueued.
-    {noreply, maybe_cancel_timer(flush_buffer(State))};
+    %% Cork timer is up, flush the buffer
+    {noreply, flush_buffer(State)};
 
 handle_info({tcp, Socket, Data}, State=#state{socket=Socket,
                                               msg_owners=Owners,
@@ -333,7 +322,7 @@ handle_info(E, S) ->
 terminate(_Reason, #state{socket = Sock, msg_owners = Owners, cork_timer = Timer}) ->
     ok = gen_tcp:close(Sock),
     true = ets:delete(Owners),
-    ok = maybe_cancel(Timer),
+    {ok, cancel} = timer:cancel(Timer),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -355,55 +344,15 @@ get_conn_ip(Pid) ->
 
 %% @doc Enqueue a message in the buffer, and update timer and flush state.
 -spec enqueue_message(Msg :: binary(), State :: state()) -> state().
-enqueue_message(Msg, State = #state{buffer=Buffer,
-                                    buffer_len=Len,
-                                    buffer_watermark=WM}) ->
-    NewLen = Len + 1,
-    NewBuffer = <<Buffer/binary, (?FRAME(Msg))/binary>>,
-    NewState = State#state{buffer=NewBuffer, buffer_len=NewLen},
-    case NewLen =:= WM of
-        true ->
-            %% Flush the buffer when the watermark is reached.
-            %% If the cork timer was active, cancel it.
-            maybe_cancel_timer(flush_buffer(NewState));
-        false ->
-            %% The cork timer starts as soon as the first message
-            %% is enqueued. After that, leave it alone.
-            maybe_rearm_timer(NewState)
-    end.
+enqueue_message(Msg, State = #state{buffer=Buffer}) ->
+    State#state{buffer = <<Buffer/binary, (?FRAME(Msg))/binary>>}.
 
 %% @private
 %% @doc Flushes the data buffer through the socket and reset the state
 -spec flush_buffer(state()) -> state().
 flush_buffer(State = #state{socket=Socket, buffer=Buffer}) ->
     ok = gen_tcp:send(Socket, Buffer),
-    State#state{buffer = <<>>, buffer_len = 0}.
-
-%% @private
-%% @doc Rearms the timer if it was not yet active
--spec maybe_rearm_timer(state()) -> state().
-maybe_rearm_timer(State=#state{cork_timer = undefined, cork_len = Span}) ->
-    {ok, TRef} = timer:send_after(Span, flush_buffer),
-    State#state{cork_timer = TRef};
-
-maybe_rearm_timer(State=#state{cork_timer = _Ref}) ->
-    State.
-
-%% @private
-%% @doc Cancels the timer if it was active
-maybe_cancel_timer(State=#state{cork_timer = undefined}) ->
-    State;
-
-maybe_cancel_timer(State=#state{cork_timer = TRef}) ->
-    timer:cancel(TRef),
-    State#state{cork_timer = undefined}.
-
-%% @private
--spec maybe_cancel(timer:tref() | undefined) -> ok.
-maybe_cancel(undefined) -> ok;
-maybe_cancel(Timer) ->
-    {ok, cancel} = timer:cancel(Timer),
-    ok.
+    State#state{buffer = <<>>}.
 
 %% @private
 %% @doc Recursively extract complete messages from Data, combined with Slice
