@@ -51,9 +51,9 @@
 -record(state, {
     socket :: gen_tcp:socket(),
     socket_ip :: inet:ip_address(),
-    %% TODO(borja): Add option to disable timer on fast networks
-    cork_timer :: timer:tref(),
+
     %% How many ms to wait between buffer flushes
+    cork_timer :: reference(),
     cork_len :: non_neg_integer(),
 
     %% Reference to use when replying to owners
@@ -248,11 +248,11 @@ init([IP, Port, Options]) ->
             {ok, {LocalIP, _LocalPort}} = inet:sockname(Socket),
             Ref = erlang:make_ref(),
             CorkLen = maps:get(cork_len, Options, ?CORK_LEN),
-            {ok, TRef} = timer:send_interval(CorkLen, flush_buffer),
+            TRef = erlang:send_after(CorkLen, self(), flush_buffer),
             {ok, #state{self_ref = Ref,
                         socket = Socket,
                         socket_ip = LocalIP,
-                        cork_timer=TRef,
+                        cork_timer = TRef,
                         cork_len = CorkLen,
                         msg_id_len = maps:get(id_len, Options, ?ID_BITS)}}
     end.
@@ -287,9 +287,14 @@ handle_cast(E, S) ->
     logger:warning("unexpected cast: ~p~n", [E]),
     {noreply, S}.
 
-handle_info(flush_buffer, State) ->
-    %% Cork timer is up, flush the buffer
-    {noreply, flush_buffer(State)};
+%% @doc Flushes the data buffer through the socket and reset the state
+handle_info(flush_buffer, State=#state{socket=Socket,
+                                       buffer=Buffer,
+                                       cork_len=After,
+                                       cork_timer=Timer}) ->
+    erlang:cancel_timer(Timer),
+    ok = gen_tcp:send(Socket, Buffer),
+    {noreply, State#state{buffer = <<>>, cork_timer = erlang:send_after(After, self(), flush_buffer)}};
 
 handle_info({tcp, Socket, Data}, State=#state{socket=Socket,
                                               msg_owners=Owners,
@@ -322,7 +327,7 @@ handle_info(E, S) ->
 terminate(_Reason, #state{socket = Sock, msg_owners = Owners, cork_timer = Timer}) ->
     ok = gen_tcp:close(Sock),
     true = ets:delete(Owners),
-    {ok, cancel} = timer:cancel(Timer),
+    erlang:cancel_timer(Timer),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -346,13 +351,6 @@ get_conn_ip(Pid) ->
 -spec enqueue_message(Msg :: binary(), State :: state()) -> state().
 enqueue_message(Msg, State = #state{buffer=Buffer}) ->
     State#state{buffer = <<Buffer/binary, (?FRAME(Msg))/binary>>}.
-
-%% @private
-%% @doc Flushes the data buffer through the socket and reset the state
--spec flush_buffer(state()) -> state().
-flush_buffer(State = #state{socket=Socket, buffer=Buffer}) ->
-    ok = gen_tcp:send(Socket, Buffer),
-    State#state{buffer = <<>>}.
 
 %% @private
 %% @doc Recursively extract complete messages from Data, combined with Slice
