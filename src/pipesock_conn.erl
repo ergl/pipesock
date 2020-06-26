@@ -11,7 +11,10 @@
          get_self_ip/1,
          send_cb/3,
          send_sync/3,
-         send_and_forget/2]).
+         send_and_forget/2,
+         send_direct_cb/3,
+         send_direct_sync/3,
+         send_direct_and_forget/2]).
 
 %% Supervisor callbacks
 -export([start_link/3]).
@@ -40,10 +43,8 @@
 
 %% How many bits in each message are reserved as id portion
 -define(ID_BITS, 16).
-%% How many milis to wait to flush a buffer after first send
+%% How many milis to wait to flush the buffer
 -define(CORK_LEN, 5).
-%% Max number of messages waiting on queue before sending
--define(BUFFER_WATERMARK, 500).
 
 %% Use the equivalent of {packet, 4} to frame the messages
 -define(FRAME(Data),
@@ -53,9 +54,9 @@
 -record(state, {
     socket :: gen_tcp:socket(),
     socket_ip :: inet:ip_address(),
-    %% TODO(borja): Add option to disable timer on fast networks
-    cork_timer = undefined :: timer:tref() | undefined,
+
     %% How many ms to wait between buffer flushes
+    cork_timer :: reference(),
     cork_len :: non_neg_integer(),
 
     %% Reference to use when replying to owners
@@ -63,13 +64,12 @@
     self_ref :: reference(),
     msg_id_len :: non_neg_integer(),
     %% ETS table mapping message ids to callbacks/pids to reply to
-    msg_owners = ets:new(msg_owners, [set, private]) :: ets:tid(),
+    msg_owners = ets:new(msg_owners, [set,
+                                      public,
+                                      {write_concurrency, true}]) :: ets:tid(),
 
     %% Buffer and ancillary state
     buffer = <<>> :: binary(),
-    %% How many messages in the buffer before we flush
-    buffer_watermark :: non_neg_integer(),
-    buffer_len = 0 :: non_neg_integer(),
 
     %% Incomplete data coming from socket (since we're framing)
     message_slice = <<>> :: binary()
@@ -84,6 +84,10 @@
     conn_ref :: reference(),
     conn_pid :: pid(),
     conn_ip :: inet:ip_address(),
+
+    %% Only used for direct send and avoiding the gen_server
+    conn_socket_raw :: inet:socket(),
+    conn_owners_table :: ets:tid(),
 
     %% Mandatory to have this info here to be able to match on the caller side
     %% without validating on the gen_server side.
@@ -154,11 +158,6 @@ open(Ip, Port) ->
 %%
 %%          The server _must_ return this header intact.
 %%
-%%      buf_watermark => non_neg_integer()
-%%          The max number of messages sitting in the connection buffer.
-%%          Once it goes over this number, the connection will automatically
-%%          flush it.
-%%
 %%      cork_len => non_neg_integer()
 %%          The max number of milis between buffer flushes.
 %%
@@ -172,16 +171,16 @@ open(Ip, Port, Options) ->
     Ret = supervisor:start_child(?SUPERVISOR, [Ip, Port, Options]),
     case Ret of
         {ok, Pid} ->
-            {ok, Ref} = get_conn_ref(Pid),
-            {ok, LocalIp} = get_conn_ip(Pid),
+            {ok, Ref, LocalIp, Socket, Owners} = get_conn_data(Pid),
             {ok, #conn_handle{conn_ref=Ref, conn_pid=Pid,
-                              id_len=IdLen, conn_ip=LocalIp}};
+                              id_len=IdLen, conn_ip=LocalIp,
+                              conn_socket_raw=Socket, conn_owners_table=Owners}};
 
         {error, {already_started, ChildPid}} ->
-            {ok, Ref} = get_conn_ref(ChildPid),
-            {ok, LocalIp} = get_conn_ip(ChildPid),
+            {ok, Ref, LocalIp, Socket, Owners} = get_conn_data(ChildPid),
             {ok, #conn_handle{conn_ref=Ref, conn_pid=ChildPid,
-                              id_len=IdLen, conn_ip=LocalIp}};
+                              id_len=IdLen, conn_ip=LocalIp,
+                              conn_socket_raw=Socket, conn_owners_table=Owners}};
 
         Err ->
             Err
@@ -245,6 +244,43 @@ send_sync_recv(Ref, Timeout) ->
 send_and_forget(#conn_handle{conn_pid=Pid}, Msg) ->
     gen_server:cast(Pid, {queue, Msg}).
 
+%% @doc Async direct send
+%%
+%%      Same as send_direct_cb/3, but sends directly without enqueing,
+%%      or going through the gen_server.
+%%
+-spec send_direct_cb(conn_handle(),
+                    Msg :: binary(),
+                    Callback :: fun((reference(), binary()) -> ok)) -> ok.
+
+send_direct_cb(#conn_handle{id_len=Len, conn_socket_raw=Socket, conn_owners_table=Owners},
+               Msg, Callback) when is_function(Callback, 2) ->
+
+    <<Id:Len, _/binary>> = Msg,
+    true = ets:insert_new(Owners, {Id, Callback}),
+    ok = gen_tcp:send(Socket, ?FRAME(Msg)),
+    ok.
+
+%% @doc Sync send
+%%
+%%      Same as send_sync/3, but sends directly without enqueing,
+%%      or going through the gen_server.
+%%
+-spec send_direct_sync(conn_handle(),
+                       Msg :: binary(),
+                       Timeout :: conn_timeout()) -> {ok, term()}
+                                                   | {error, timeout}.
+
+send_direct_sync(Conn=#conn_handle{conn_ref=Ref}, Msg, Timeout) ->
+    Self = self(),
+    send_direct_cb(Conn, Msg, fun(ConnRef, Reply) -> Self ! {ConnRef, Reply} end),
+    send_sync_recv(Ref, Timeout).
+
+%% @doc Async direct send, where we don't expect a reply
+-spec send_direct_and_forget(conn_handle(), Msg :: binary()) -> ok.
+send_direct_and_forget(#conn_handle{conn_socket_raw=Socket}, Msg) ->
+    ok = gen_tcp:send(Socket, ?FRAME(Msg)).
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -258,13 +294,13 @@ init([IP, Port, Options]) ->
             {ok, {LocalIP, _LocalPort}} = inet:sockname(Socket),
             Ref = erlang:make_ref(),
             CorkLen = maps:get(cork_len, Options, ?CORK_LEN),
-            BufferWatermark = maps:get(buf_watermark, Options, ?BUFFER_WATERMARK),
+            TRef = erlang:send_after(CorkLen, self(), flush_buffer),
             {ok, #state{self_ref = Ref,
                         socket = Socket,
                         socket_ip = LocalIP,
+                        cork_timer = TRef,
                         cork_len = CorkLen,
-                        msg_id_len = maps:get(id_len, Options, ?ID_BITS),
-                        buffer_watermark = BufferWatermark}}
+                        msg_id_len = maps:get(id_len, Options, ?ID_BITS)}}
     end.
 
 %% @doc Get back the unique reference of this connection
@@ -273,6 +309,9 @@ handle_call(get_ref, _From, State = #state{self_ref=Ref}) ->
 
 handle_call(get_ip, _From, State = #state{socket_ip=Ip}) ->
     {reply, {ok, Ip}, State};
+
+handle_call(get_conn_data, _From, State = #state{self_ref=Ref, socket_ip=Ip, socket=Sock, msg_owners=Owners}) ->
+    {reply, {ok, Ref, Ip, Sock, Owners}, State};
 
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
@@ -297,10 +336,14 @@ handle_cast(E, S) ->
     logger:warning("unexpected cast: ~p~n", [E]),
     {noreply, S}.
 
-handle_info(flush_buffer, State) ->
-    %% Cork timer is up, flush the buffer and wait for another message
-    %% to be enqueued.
-    {noreply, maybe_cancel_timer(flush_buffer(State))};
+%% @doc Flushes the data buffer through the socket and reset the state
+handle_info(flush_buffer, State=#state{socket=Socket,
+                                       buffer=Buffer,
+                                       cork_len=After,
+                                       cork_timer=Timer}) ->
+    erlang:cancel_timer(Timer),
+    ok = gen_tcp:send(Socket, Buffer),
+    {noreply, State#state{buffer = <<>>, cork_timer = erlang:send_after(After, self(), flush_buffer)}};
 
 handle_info({tcp, Socket, Data}, State=#state{socket=Socket,
                                               msg_owners=Owners,
@@ -333,7 +376,7 @@ handle_info(E, S) ->
 terminate(_Reason, #state{socket = Sock, msg_owners = Owners, cork_timer = Timer}) ->
     ok = gen_tcp:close(Sock),
     true = ets:delete(Owners),
-    ok = maybe_cancel(Timer),
+    erlang:cancel_timer(Timer),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -344,66 +387,14 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 
 %% @private
--spec get_conn_ref(Pid :: pid()) -> {ok, reference()}.
-get_conn_ref(Pid) ->
-    gen_server:call(Pid, get_ref, infinity).
-
-%% @private
--spec get_conn_ip(Pid :: pid()) -> {ok, inet:ip_address()}.
-get_conn_ip(Pid) ->
-    gen_server:call(Pid, get_ip, infinity).
+-spec get_conn_data(Pid :: pid()) -> {ok, reference(), inet:ip_address(), inet:socket(), ets:tid()}.
+get_conn_data(Pid) ->
+    gen_server:call(Pid, get_conn_data, infinity).
 
 %% @doc Enqueue a message in the buffer, and update timer and flush state.
 -spec enqueue_message(Msg :: binary(), State :: state()) -> state().
-enqueue_message(Msg, State = #state{buffer=Buffer,
-                                    buffer_len=Len,
-                                    buffer_watermark=WM}) ->
-    NewLen = Len + 1,
-    NewBuffer = <<Buffer/binary, (?FRAME(Msg))/binary>>,
-    NewState = State#state{buffer=NewBuffer, buffer_len=NewLen},
-    case NewLen =:= WM of
-        true ->
-            %% Flush the buffer when the watermark is reached.
-            %% If the cork timer was active, cancel it.
-            maybe_cancel_timer(flush_buffer(NewState));
-        false ->
-            %% The cork timer starts as soon as the first message
-            %% is enqueued. After that, leave it alone.
-            maybe_rearm_timer(NewState)
-    end.
-
-%% @private
-%% @doc Flushes the data buffer through the socket and reset the state
--spec flush_buffer(state()) -> state().
-flush_buffer(State = #state{socket=Socket, buffer=Buffer}) ->
-    ok = gen_tcp:send(Socket, Buffer),
-    State#state{buffer = <<>>, buffer_len = 0}.
-
-%% @private
-%% @doc Rearms the timer if it was not yet active
--spec maybe_rearm_timer(state()) -> state().
-maybe_rearm_timer(State=#state{cork_timer = undefined, cork_len = Span}) ->
-    {ok, TRef} = timer:send_after(Span, flush_buffer),
-    State#state{cork_timer = TRef};
-
-maybe_rearm_timer(State=#state{cork_timer = _Ref}) ->
-    State.
-
-%% @private
-%% @doc Cancels the timer if it was active
-maybe_cancel_timer(State=#state{cork_timer = undefined}) ->
-    State;
-
-maybe_cancel_timer(State=#state{cork_timer = TRef}) ->
-    timer:cancel(TRef),
-    State#state{cork_timer = undefined}.
-
-%% @private
--spec maybe_cancel(timer:tref() | undefined) -> ok.
-maybe_cancel(undefined) -> ok;
-maybe_cancel(Timer) ->
-    {ok, cancel} = timer:cancel(Timer),
-    ok.
+enqueue_message(Msg, State = #state{buffer=Buffer}) ->
+    State#state{buffer = <<Buffer/binary, (?FRAME(Msg))/binary>>}.
 
 %% @private
 %% @doc Recursively extract complete messages from Data, combined with Slice
