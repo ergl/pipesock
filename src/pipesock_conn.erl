@@ -56,7 +56,7 @@
     socket_ip :: inet:ip_address(),
 
     %% How many ms to wait between buffer flushes
-    cork_timer :: reference(),
+    cork_timer :: reference() | undefined,
     cork_len :: non_neg_integer(),
 
     %% Reference to use when replying to owners
@@ -294,7 +294,10 @@ init([IP, Port, Options]) ->
             {ok, {LocalIP, _LocalPort}} = inet:sockname(Socket),
             Ref = erlang:make_ref(),
             CorkLen = maps:get(cork_len, Options, ?CORK_LEN),
-            TRef = erlang:send_after(CorkLen, self(), flush_buffer),
+            TRef = case CorkLen of
+                disable -> undefined;
+                Millis -> erlang:send_after(Millis, self(), flush_buffer)
+            end,
             {ok, #state{self_ref = Ref,
                         socket = Socket,
                         socket_ip = LocalIP,
@@ -340,7 +343,7 @@ handle_cast(E, S) ->
 handle_info(flush_buffer, State=#state{socket=Socket,
                                        buffer=Buffer,
                                        cork_len=After,
-                                       cork_timer=Timer}) ->
+                                       cork_timer=Timer}) when Timer =/= undefined ->
     erlang:cancel_timer(Timer),
     ok = gen_tcp:send(Socket, Buffer),
     {noreply, State#state{buffer = <<>>, cork_timer = erlang:send_after(After, self(), flush_buffer)}};
@@ -376,7 +379,10 @@ handle_info(E, S) ->
 terminate(_Reason, #state{socket = Sock, msg_owners = Owners, cork_timer = Timer}) ->
     ok = gen_tcp:close(Sock),
     true = ets:delete(Owners),
-    erlang:cancel_timer(Timer),
+    case Timer of
+        undefined -> ok;
+        Ref -> erlang:cancel_timer(Ref)
+    end,
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
