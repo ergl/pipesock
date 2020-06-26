@@ -11,7 +11,10 @@
          get_self_ip/1,
          send_cb/3,
          send_sync/3,
-         send_and_forget/2]).
+         send_and_forget/2,
+         send_direct_cb/3,
+         send_direct_sync/3,
+         send_direct_and_forget/2]).
 
 %% Supervisor callbacks
 -export([start_link/3]).
@@ -61,7 +64,9 @@
     self_ref :: reference(),
     msg_id_len :: non_neg_integer(),
     %% ETS table mapping message ids to callbacks/pids to reply to
-    msg_owners = ets:new(msg_owners, [set, private]) :: ets:tid(),
+    msg_owners = ets:new(msg_owners, [set,
+                                      public,
+                                      {write_concurrency, true}]) :: ets:tid(),
 
     %% Buffer and ancillary state
     buffer = <<>> :: binary(),
@@ -79,6 +84,10 @@
     conn_ref :: reference(),
     conn_pid :: pid(),
     conn_ip :: inet:ip_address(),
+
+    %% Only used for direct send and avoiding the gen_server
+    conn_socket_raw :: inet:socket(),
+    conn_owners_table :: ets:tid(),
 
     %% Mandatory to have this info here to be able to match on the caller side
     %% without validating on the gen_server side.
@@ -162,16 +171,16 @@ open(Ip, Port, Options) ->
     Ret = supervisor:start_child(?SUPERVISOR, [Ip, Port, Options]),
     case Ret of
         {ok, Pid} ->
-            {ok, Ref} = get_conn_ref(Pid),
-            {ok, LocalIp} = get_conn_ip(Pid),
+            {ok, Ref, LocalIp, Socket, Owners} = get_conn_data(Pid),
             {ok, #conn_handle{conn_ref=Ref, conn_pid=Pid,
-                              id_len=IdLen, conn_ip=LocalIp}};
+                              id_len=IdLen, conn_ip=LocalIp,
+                              conn_socket_raw=Socket, conn_owners_table=Owners}};
 
         {error, {already_started, ChildPid}} ->
-            {ok, Ref} = get_conn_ref(ChildPid),
-            {ok, LocalIp} = get_conn_ip(ChildPid),
+            {ok, Ref, LocalIp, Socket, Owners} = get_conn_data(ChildPid),
             {ok, #conn_handle{conn_ref=Ref, conn_pid=ChildPid,
-                              id_len=IdLen, conn_ip=LocalIp}};
+                              id_len=IdLen, conn_ip=LocalIp,
+                              conn_socket_raw=Socket, conn_owners_table=Owners}};
 
         Err ->
             Err
@@ -235,6 +244,43 @@ send_sync_recv(Ref, Timeout) ->
 send_and_forget(#conn_handle{conn_pid=Pid}, Msg) ->
     gen_server:cast(Pid, {queue, Msg}).
 
+%% @doc Async direct send
+%%
+%%      Same as send_direct_cb/3, but sends directly without enqueing,
+%%      or going through the gen_server.
+%%
+-spec send_direct_cb(conn_handle(),
+                    Msg :: binary(),
+                    Callback :: fun((reference(), binary()) -> ok)) -> ok.
+
+send_direct_cb(#conn_handle{id_len=Len, conn_socket_raw=Socket, conn_owners_table=Owners},
+               Msg, Callback) when is_function(Callback, 2) ->
+
+    <<Id:Len, _/binary>> = Msg,
+    true = ets:insert_new(Owners, {Id, Callback}),
+    ok = gen_tcp:send(Socket, ?FRAME(Msg)),
+    ok.
+
+%% @doc Sync send
+%%
+%%      Same as send_sync/3, but sends directly without enqueing,
+%%      or going through the gen_server.
+%%
+-spec send_direct_sync(conn_handle(),
+                       Msg :: binary(),
+                       Timeout :: conn_timeout()) -> {ok, term()}
+                                                   | {error, timeout}.
+
+send_direct_sync(Conn=#conn_handle{conn_ref=Ref}, Msg, Timeout) ->
+    Self = self(),
+    send_direct_cb(Conn, Msg, fun(ConnRef, Reply) -> Self ! {ConnRef, Reply} end),
+    send_sync_recv(Ref, Timeout).
+
+%% @doc Async direct send, where we don't expect a reply
+-spec send_direct_and_forget(conn_handle(), Msg :: binary()) -> ok.
+send_direct_and_forget(#conn_handle{conn_socket_raw=Socket}, Msg) ->
+    ok = gen_tcp:send(Socket, ?FRAME(Msg)).
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -263,6 +309,9 @@ handle_call(get_ref, _From, State = #state{self_ref=Ref}) ->
 
 handle_call(get_ip, _From, State = #state{socket_ip=Ip}) ->
     {reply, {ok, Ip}, State};
+
+handle_call(get_conn_data, _From, State = #state{self_ref=Ref, socket_ip=Ip, socket=Sock, msg_owners=Owners}) ->
+    {reply, {ok, Ref, Ip, Sock, Owners}, State};
 
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
@@ -338,14 +387,9 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 
 %% @private
--spec get_conn_ref(Pid :: pid()) -> {ok, reference()}.
-get_conn_ref(Pid) ->
-    gen_server:call(Pid, get_ref, infinity).
-
-%% @private
--spec get_conn_ip(Pid :: pid()) -> {ok, inet:ip_address()}.
-get_conn_ip(Pid) ->
-    gen_server:call(Pid, get_ip, infinity).
+-spec get_conn_data(Pid :: pid()) -> {ok, reference(), inet:ip_address(), inet:socket(), ets:tid()}.
+get_conn_data(Pid) ->
+    gen_server:call(Pid, get_conn_data, infinity).
 
 %% @doc Enqueue a message in the buffer, and update timer and flush state.
 -spec enqueue_message(Msg :: binary(), State :: state()) -> state().
