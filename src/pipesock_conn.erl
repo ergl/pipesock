@@ -64,9 +64,7 @@
     self_ref :: reference(),
     msg_id_len :: non_neg_integer(),
     %% ETS table mapping message ids to callbacks/pids to reply to
-    msg_owners = ets:new(msg_owners, [set,
-                                      public,
-                                      {write_concurrency, true}]) :: ets:tid(),
+    msg_owners = ets:new(msg_owners, [set, private]) :: ets:tid(),
 
     %% Buffer and ancillary state
     buffer = <<>> :: binary(),
@@ -84,10 +82,6 @@
     conn_ref :: reference(),
     conn_pid :: pid(),
     conn_ip :: inet:ip_address(),
-
-    %% Only used for direct send and avoiding the gen_server
-    conn_socket_raw :: inet:socket(),
-    conn_owners_table :: ets:tid(),
 
     %% Mandatory to have this info here to be able to match on the caller side
     %% without validating on the gen_server side.
@@ -171,16 +165,14 @@ open(Ip, Port, Options) ->
     Ret = supervisor:start_child(?SUPERVISOR, [Ip, Port, Options]),
     case Ret of
         {ok, Pid} ->
-            {ok, Ref, LocalIp, Socket, Owners} = get_conn_data(Pid),
+            {ok, Ref, LocalIp} = get_conn_data(Pid),
             {ok, #conn_handle{conn_ref=Ref, conn_pid=Pid,
-                              id_len=IdLen, conn_ip=LocalIp,
-                              conn_socket_raw=Socket, conn_owners_table=Owners}};
+                              id_len=IdLen, conn_ip=LocalIp}};
 
         {error, {already_started, ChildPid}} ->
-            {ok, Ref, LocalIp, Socket, Owners} = get_conn_data(ChildPid),
+            {ok, Ref, LocalIp} = get_conn_data(ChildPid),
             {ok, #conn_handle{conn_ref=Ref, conn_pid=ChildPid,
-                              id_len=IdLen, conn_ip=LocalIp,
-                              conn_socket_raw=Socket, conn_owners_table=Owners}};
+                              id_len=IdLen, conn_ip=LocalIp}};
 
         Err ->
             Err
@@ -253,12 +245,11 @@ send_and_forget(#conn_handle{conn_pid=Pid}, Msg) ->
                     Msg :: binary(),
                     Callback :: fun((reference(), binary()) -> ok)) -> ok.
 
-send_direct_cb(#conn_handle{id_len=Len, conn_socket_raw=Socket, conn_owners_table=Owners},
+send_direct_cb(#conn_handle{conn_pid=Pid, id_len=Len},
                Msg, Callback) when is_function(Callback, 2) ->
 
     <<Id:Len, _/binary>> = Msg,
-    true = ets:insert_new(Owners, {Id, Callback}),
-    ok = gen_tcp:send(Socket, ?FRAME(Msg)),
+    ok = gen_server:call(Pid, {send, Id, Msg, Callback}),
     ok.
 
 %% @doc Sync send
@@ -278,8 +269,9 @@ send_direct_sync(Conn=#conn_handle{conn_ref=Ref}, Msg, Timeout) ->
 
 %% @doc Async direct send, where we don't expect a reply
 -spec send_direct_and_forget(conn_handle(), Msg :: binary()) -> ok.
-send_direct_and_forget(#conn_handle{conn_socket_raw=Socket}, Msg) ->
-    ok = gen_tcp:send(Socket, ?FRAME(Msg)).
+send_direct_and_forget(#conn_handle{conn_pid=Pid}, Msg) ->
+    ok = gen_server:call(Pid, {send, Msg}),
+    ok.
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -313,8 +305,17 @@ handle_call(get_ref, _From, State = #state{self_ref=Ref}) ->
 handle_call(get_ip, _From, State = #state{socket_ip=Ip}) ->
     {reply, {ok, Ip}, State};
 
-handle_call(get_conn_data, _From, State = #state{self_ref=Ref, socket_ip=Ip, socket=Sock, msg_owners=Owners}) ->
-    {reply, {ok, Ref, Ip, Sock, Owners}, State};
+handle_call(get_conn_data, _From, State = #state{self_ref=Ref, socket_ip=Ip}) ->
+    {reply, {ok, Ref, Ip}, State};
+
+handle_call({send, Id, Msg, Callback}, _From, State = #state{socket=Socket, msg_owners=Owners}) ->
+    true = ets:insert_new(Owners, {Id, Callback}),
+    ok = gen_tcp:send(Socket, ?FRAME(Msg)),
+    {reply, ok, State};
+
+handle_call({send, Msg}, _From, State = #state{socket=Socket}) ->
+    ok = gen_tcp:send(Socket, ?FRAME(Msg)),
+    {reply, ok, State};
 
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
@@ -393,7 +394,7 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 
 %% @private
--spec get_conn_data(Pid :: pid()) -> {ok, reference(), inet:ip_address(), inet:socket(), ets:tid()}.
+-spec get_conn_data(Pid :: pid()) -> {ok, reference(), inet:ip_address()}.
 get_conn_data(Pid) ->
     gen_server:call(Pid, get_conn_data, infinity).
 
